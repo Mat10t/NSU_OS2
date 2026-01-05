@@ -18,6 +18,21 @@ typedef struct task {
     char dst[PATH_MAX];
 } task_t;
 
+int safe_open_file(const char* file, int flag, mode_t mode) {
+    int fd = -1;
+    while (1) {
+        fd = open(file, flag, mode);
+        if (fd != -1) {
+            break;
+        }
+        if (errno != EMFILE) {
+            break;
+        }
+        sleep(1);
+    }
+    return fd;
+}
+
 void *copy_file(void *arg) {
     task_t *task = (task_t *)arg;
     int src_fd = -1;
@@ -29,30 +44,18 @@ void *copy_file(void *arg) {
         free(task);
         return NULL;
     }
-    while (1) {
-        src_fd = open(task->source, O_RDONLY);
-        if (src_fd != -1) {
-            break;
-        }
-        if (errno != EMFILE) {
-            fprintf(stderr, "copy_file: open source error\n");
-            free(task);
-            return NULL;
-        }
-        sleep(1);
+    src_fd = safe_open_file(task->source, O_RDONLY, 0);
+    if (src_fd == -1) {
+        fprintf(stderr, "copy_file: open source error\n");
+        free(task);
+        return NULL;
     }
-    while (1) {
-        dst_fd = open(task->dst, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
-        if (dst_fd != -1) {
-            break;
-        }
-        if (errno != EMFILE) {
-            fprintf(stderr, "copy_file: open destination error\n");
-            close(src_fd);
-            free(task);
-            return NULL;
-        }
-        sleep(1);
+    dst_fd = safe_open_file(task->dst, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
+    if (dst_fd == -1) {
+        fprintf(stderr, "copy_file: open destination error\n");
+        close(src_fd);
+        free(task);
+        return NULL;
     }
     ssize_t bytes_read;
     ssize_t bytes_written;
@@ -80,10 +83,23 @@ void *copy_file(void *arg) {
     return NULL;
 }
 
-int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg) {
+int safe_pthread_create(void *(*start_routine)(void *), void *arg) {
+    pthread_t th;
+    pthread_attr_t attr;
     int err;
+    err = pthread_attr_init(&attr);
+    if (err != 0) {
+        fprintf(stderr, "safe_pthread_create: pthread_attr_init error\n");
+        return err;
+    }
+    err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (err != 0) {
+        fprintf(stderr, "safe_pthread_create: pthread_attr_setdetachstate error\n");
+        pthread_attr_destroy(&attr);
+        return err;
+    }
     while (1) {
-        err = pthread_create(thread, attr, start_routine, arg);
+        err = pthread_create(&th, &attr, start_routine, arg);
         if (err == 0) {
             break;
         }
@@ -92,6 +108,7 @@ int safe_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*s
         }
         sleep(1);
     }
+    pthread_attr_destroy(&attr);
     return err;
 }
 
@@ -103,6 +120,29 @@ int build_safe_path(const char *dir, const char *file, char *out, size_t out_siz
         return -1;
     }
     snprintf(out, out_size, "%s/%s", dir, file);
+    return 0;
+}
+
+typedef struct dir_task_node {
+    task_t *task;
+    struct dir_task_node *next;
+} dir_task_node_t;
+
+int add_task(dir_task_node_t **head, dir_task_node_t **tail, task_t *task) {
+    dir_task_node_t *node = malloc(sizeof(*node));
+    if (!node) {
+        fprintf(stderr, "add_task: malloc error\n");
+        return -1;
+    }
+    node->task = task;
+    node->next = NULL;
+
+    if (*tail) {
+        (*tail)->next = node;
+    } else {
+        *head = node;
+    }
+    *tail = node;
     return 0;
 }
 
@@ -146,24 +186,11 @@ void *process_directory(void *arg) {
         }
         sleep(1);
     }
-    int file_count = 0;
+    dir_task_node_t *dirs_head = NULL;
+    dir_task_node_t *dirs_tail = NULL;
+    int readdir_err;
     struct dirent *entry = NULL;
-    while (readdir_r(dir, readdir_r_buf, &entry) == 0 && entry != NULL) {
-        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
-            file_count++;
-        }
-    }
-    pthread_t *threads = malloc(sizeof(*threads) * file_count);
-    if (!threads && file_count > 0) {
-        fprintf(stderr, "process_directory: malloc threads error\n");
-        closedir(dir);
-        free(readdir_r_buf);
-        free(task);
-        return NULL;
-    }
-    int thread_count = 0;
-    rewinddir(dir);
-    while (readdir_r(dir, readdir_r_buf, &entry) == 0 && entry != NULL) {
+    while ((readdir_err = readdir_r(dir, readdir_r_buf, &entry)) == 0 && entry != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
@@ -180,7 +207,6 @@ void *process_directory(void *arg) {
             fprintf(stderr, "process_directory: lstat error\n");
             continue;
         }
-        int create_err = -1;
         task_t *new_task = malloc(sizeof(*new_task));
         if (!new_task) {
             fprintf(stderr, "process_directory: malloc error\n");
@@ -189,27 +215,38 @@ void *process_directory(void *arg) {
         strncpy(new_task->source, src_full, PATH_MAX);
         strncpy(new_task->dst, dst_full, PATH_MAX);
         if (S_ISREG(st.st_mode)) {
-            create_err = safe_pthread_create(&threads[thread_count], NULL, copy_file, new_task);
+            int create_err = safe_pthread_create(copy_file, new_task);
+            if (create_err != 0) {
+                fprintf(stderr, "process_directory: pthread_create error\n");
+                free(new_task);
+            }
         } else if (S_ISDIR(st.st_mode)) {
-            create_err = safe_pthread_create(&threads[thread_count], NULL, process_directory, new_task);
+            if (add_task(&dirs_head, &dirs_tail, new_task) != 0) {
+                fprintf(stderr, "process_directory: add_task error\n");
+                free(new_task);
+            }
         } else {
             free(new_task);
             continue;
         }
-        if (create_err == 0) {
-            thread_count++;
-        } else {
-            free(new_task);
-        }
     }
-    for (int i = 0; i < thread_count; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    if (threads) {
-        free(threads);
+    if (readdir_err != 0) {
+        fprintf(stderr, "process_directory: readdir_r error: %s\n", strerror(readdir_err));
     }
     free(readdir_r_buf);
     closedir(dir);
+    for (dir_task_node_t *node = dirs_head; node != NULL; ) {
+        dir_task_node_t *next = node->next;
+
+        int create_err = safe_pthread_create(process_directory, node->task);
+        if (create_err != 0) {
+            fprintf(stderr, "process_directory: pthread_create error\n");
+            free(node->task);
+        }
+
+        free(node);
+        node = next;
+    }
     free(task);
     return NULL;
 }
@@ -219,7 +256,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <source_dir> <dest_dir>\n", argv[0]);
         return 1;
     }
-
     char real_src[PATH_MAX];
     char real_dst[PATH_MAX];
     if (realpath(argv[1], real_src) == NULL) {
@@ -251,8 +287,12 @@ int main(int argc, char *argv[]) {
         }
     }
     task_t *root_task = malloc(sizeof(*root_task));
+    if (!root_task) {
+        fprintf(stderr, "main: malloc error\n");
+        return 1;
+    }
     strncpy(root_task->source, real_src, PATH_MAX);
     strncpy(root_task->dst, real_dst, PATH_MAX);
     process_directory(root_task);
-    return 0;
+    pthread_exit(NULL);
 }
